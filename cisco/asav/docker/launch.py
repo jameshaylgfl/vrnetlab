@@ -5,12 +5,33 @@ import logging
 import os
 import re
 import signal
+import subprocess
 import sys
 
 import vrnetlab
 from scrapli import Scrapli
 
 STARTUP_CONFIG_FILE = "/config/startup-config.cfg"
+
+# DAY0: hand the ASA its whole configuration on a CD-ROM, the way Cisco
+# deploys ASAv on KVM, instead of typing it at the serial console. The
+# console is 80 columns: any line much over fifty characters wraps, the
+# ASA redraws it with backspaces, scrapli never matches a prompt again
+# and the launcher times out and takes the container with it. And an HA
+# pair typed in parallel forms part-way through, after which the new
+# standby refuses the rest. From day0 both units boot fully configured,
+# which is how a real pair powered up together behaves.
+#
+# Opt-in with ASAV_DAY0=1, so without it this image is unchanged.
+DAY0_CONFIG_FILE = "/day0-config"
+DAY0_ISO = "/day0.iso"
+# End of boot on a day0 ASA: the banner before the first prompt, or an
+# exec prompt - role first when failover is configured - NOT anchored at
+# end of line, because failover prints progress dots after it.
+DAY0_READY = (
+    r"(?m)Type help or '\?' for a list of available commands"
+    r"|^[\w.-]+(/[\w.-]+)*> "
+)
 
 # ASA has some password complexity requirements
 ENABLE_PASSWORD = "CiscoAsa1!"
@@ -60,6 +81,35 @@ class ASAv_vm(vrnetlab.VM):
         self.install_mode = install_mode
         self.num_nics = 8
 
+        self.day0 = (
+            not install_mode
+            and os.environ.get("ASAV_DAY0", "0") == "1"
+            and os.path.exists(STARTUP_CONFIG_FILE)
+        )
+        if self.day0:
+            with open(STARTUP_CONFIG_FILE, "r") as config:
+                startup_config = config.read()
+            # `console serial` first, as in Cisco's own KVM day0 example:
+            # the launcher and every console tool here read ttyS0, and a
+            # day0 ASAv is not guaranteed to keep its console there.
+            self.create_day0_image(
+                "console serial\n"
+                + self.gen_bootstrap_config()
+                + "\n"
+                + startup_config
+            )
+            self.qemu_args.extend(["-cdrom", DAY0_ISO])
+
+    def create_day0_image(self, config):
+        """Write the config as `day0-config` at the root of an ISO."""
+        with open(DAY0_CONFIG_FILE, "w") as cfg:
+            cfg.write(config)
+        self.logger.info("Generating day0 ISO (%d lines)", len(config.splitlines()))
+        subprocess.run(
+            ["genisoimage", "-r", "-l", "-o", DAY0_ISO, DAY0_CONFIG_FILE],
+            check=True,
+        )
+
     def bootstrap_spin(self):
         """This function should be called periodically to do work."""
 
@@ -67,6 +117,40 @@ class ASAv_vm(vrnetlab.VM):
             # too many spins with no result ->  give up
             self.stop()
             self.start()
+            return
+
+        if self.day0:
+            # Configured from day0, so there is nothing to type - only the
+            # end of boot to recognise, and it MUST be recognised: until it
+            # is, con_expect() is a BLOCKING read, and an hour of quiet
+            # console raises ScrapliTimeout and the container exits.
+            #
+            # The marker is the banner the ASA prints once, straight before
+            # its first prompt. Not the prompt itself: it carries the role
+            # first (`pri/act/fw1>`) and, while a pair forms,
+            # failover writes progress on the SAME line (`...> .`). The
+            # buffer carries across reads, so a line split between two
+            # reads is still seen.
+            (ridx, match, res) = self.con_expect([b"\x00"], 1)
+            if res != b"":
+                self.write_to_stdout(res)
+                self.spins = 0
+            self.day0_seen = (getattr(self, "day0_seen", b"") + res)[-8192:]
+            text = self.day0_seen.decode(errors="ignore")
+            if re.search(DAY0_READY, text):
+                startup_time = datetime.datetime.now() - self.start_time
+                self.logger.info("day0 configuration applied at boot")
+                self.logger.info("Startup complete in: %s" % startup_time)
+                # Let go of the console, as the typed path does when it
+                # finishes: it takes one client at a time, and holding it
+                # locks out `telnet 127.0.0.1 5000` for the life of the box.
+                self.scrapli_tn.close()
+                self.running = True
+                return
+            if res == b"" and self.spins and self.spins % 30 == 0:
+                # Belt and braces: a fresh prompt on a line of its own.
+                self.wait_write("", wait=None)
+            self.spins += 1
             return
 
         (ridx, match, res) = self.con_expect([b"ciscoasa>"], 1)
@@ -103,6 +187,38 @@ class ASAv_vm(vrnetlab.VM):
         self.spins += 1
 
         return
+
+    def gen_bootstrap_config(self):
+        """Management address, the lab user and SSH: what vrnetlab needs."""
+        v4_mgmt_address = vrnetlab.cidr_to_ddn(self.mgmt_address_ipv4)
+        ipv6_address = self.render_optional_mgmt_config(
+            "ipv6 address {address}", address=self.mgmt_address_ipv6
+        )
+        ipv6_route = self.render_optional_mgmt_config(
+            "route management ::/0 {gateway} 1", gateway=self.mgmt_gw_ipv6
+        )
+
+        return f"""hostname {self.hostname}
+aaa authentication ssh console LOCAL
+aaa authentication enable console LOCAL
+username {self.username} password {self.password} privilege 15
+interface Management0/0
+nameif management
+security-level 100
+ip address {v4_mgmt_address[0]} {v4_mgmt_address[1]}
+{ipv6_address}
+no shutdown
+exit
+route management 0.0.0.0 0.0.0.0 {self.mgmt_gw_ipv4} 1
+{ipv6_route}
+access-list MGMT_IN extended permit tcp any any eq ssh
+access-group MGMT_IN in interface management
+crypto key generate ecdsa elliptic-curve 256
+ssh key-exchange group dh-group14-sha256
+ssh 0.0.0.0 0.0.0.0 management
+ssh ::/0 management
+no ssh stricthostkeycheck
+ssh timeout 60"""
 
     def apply_config(self):
         """Apply the full configuration"""
@@ -159,35 +275,7 @@ class ASAv_vm(vrnetlab.VM):
             ]
         )
 
-        v4_mgmt_address = vrnetlab.cidr_to_ddn(self.mgmt_address_ipv4)
-        ipv6_address = self.render_optional_mgmt_config(
-            "ipv6 address {address}", address=self.mgmt_address_ipv6
-        )
-        ipv6_route = self.render_optional_mgmt_config(
-            "route management ::/0 {gateway} 1", gateway=self.mgmt_gw_ipv6
-        )
-
-        config_commands = f"""hostname {self.hostname}
-aaa authentication ssh console LOCAL
-aaa authentication enable console LOCAL
-username {self.username} password {self.password} privilege 15
-interface Management0/0
-nameif management
-security-level 100
-ip address {v4_mgmt_address[0]} {v4_mgmt_address[1]}
-{ipv6_address}
-no shutdown
-exit
-route management 0.0.0.0 0.0.0.0 {self.mgmt_gw_ipv4} 1
-{ipv6_route}
-access-list MGMT_IN extended permit tcp any any eq ssh
-access-group MGMT_IN in interface management
-crypto key generate ecdsa elliptic-curve 256
-ssh key-exchange group dh-group14-sha256
-ssh 0.0.0.0 0.0.0.0 management
-ssh ::/0 management
-no ssh stricthostkeycheck
-ssh timeout 60"""
+        config_commands = self.gen_bootstrap_config()
 
         self.logger.debug("Sending configuration commands")
         con.send_configs(config_commands.splitlines())
