@@ -7,7 +7,7 @@ usage() {
 }
 cleanup () {
 	echo "Cleaning up..."
-	umount -f -q $MNTDIR
+	sync; umount $MNTDIR
 	losetup -d $LOOPDEV
 	rm -rfv $STAGING
 	rm -rfv $MNTDIR
